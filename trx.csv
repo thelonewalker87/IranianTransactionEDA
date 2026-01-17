@@ -1,0 +1,5 @@
+status,time,card_type,city,amount,id
+success,23:00 2025-09-10,Visa,TEHRAN,200000,1
+fail,03:00 2025-09-11,Vsa,Tehran,0,2
+success,,MasterCard,Tehran,-5000,3
+success,01:00 2025-09-11,Visa,THR,99999999,4
