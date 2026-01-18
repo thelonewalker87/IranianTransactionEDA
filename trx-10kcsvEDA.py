@@ -18,11 +18,7 @@ df = spark.read \
     .option("mode", "DROPMALFORMED") \
     .csv("C:\\Users\\Ahaan\\Desktop\\AI\\IranTransactionEDA\\trx-10k.csv")
 
-print("Initial Schema")
-df.printSchema()
-df.show(5)
-
-# Identify Column Types
+# Identify numeric and non-numeric columns
 numeric_cols = [
     c for c, t in df.dtypes
     if t in ["int", "bigint", "double", "float"]
@@ -32,110 +28,131 @@ non_numeric_cols = [
     c for c in df.columns if c not in numeric_cols
 ]
 
-# Null Counts (SAFE)
-numeric_nulls = df.select([
-    count(
-        when(col(c).isNull() | isnan(col(c)), c)
-    ).alias(c)
-    for c in numeric_cols
-])
+# Standardize categorical columns
+for c in non_numeric_cols:
+    df = df.withColumn(
+        c,
+        lower(
+            trim(
+                regexp_replace(col(c), "\\s+", " ")
+            )
+        )
+    )
 
-non_numeric_nulls = df.select([
-    count(
-        when(col(c).isNull(), c)
-    ).alias(c)
-    for c in non_numeric_cols
-])
+# Unify status values
+df = df.withColumn(
+    "status",
+    when(col("status").isin(
+        "success", "succeed", "successful", "succeded", "ok", "completed"
+    ), "Success")
+    .when(col("status").isin(
+        "fail", "failed", "failure", "unsuccessful", "declined", "error"
+    ), "Fail")
+    .otherwise("Unknown")
+)
 
-numeric_nulls.show()
-non_numeric_nulls.show()
+# Unify city values
+df = df.withColumn(
+    "city",
+    when(col("city").isin(
+        "tehran", "thr", "tehr@n", "teheran", "thran", "teh ran", "t e h r a n"
+    ), "Tehran")
+    .otherwise(initcap(col("city")))
+)
 
-# Remove commas from all columns
+# Unify card types
+df = df.withColumn(
+    "card_type",
+    when(col("card_type").isin(
+        "visa", "vsa", "vi sa", "visa-card", "visa card"
+    ), "Visa")
+    .when(col("card_type").isin(
+        "mastercard", "master card", "master-card", "mastcard", "mstrcrd", "mc"
+    ), "MasterCard")
+    .when(col("card_type").isin(
+        "amex", "american express", "american-express", "am ex"
+    ), "Amex")
+    .otherwise(initcap(col("card_type")))
+)
+
+# Remove commas
 for c in df.columns:
     df = df.withColumn(c, regexp_replace(col(c), ",", ""))
 
-# Cast numeric columns again
+# Cast numeric columns
 for c in numeric_cols:
     df = df.withColumn(c, col(c).cast(DoubleType()))
 
-# Drop rows with null numeric values
+# Drop nulls and duplicates
 df = df.dropna(subset=numeric_cols)
-
-# Remove duplicate rows
 df = df.dropDuplicates()
 
-# Descriptive statistics
-df.select(numeric_cols).describe().show()
+# Feature engineering
+df = df.withColumn("hour", hour(col("time")))
+df = df.withColumn("date", to_date(col("time")))
 
-# Feature Engineering
-df = df.withColumn("log_amount", log1p(col("amount")))
-
-# Outlier Detection (IQR)
-quantiles = df.approxQuantile("amount", [0.25, 0.75], 0.01)
-Q1, Q3 = quantiles
-IQR = Q3 - Q1
-
+# 4-hour bins
 df = df.withColumn(
-    "amount_outlier",
-    when(
-        (col("amount") < Q1 - 1.5 * IQR) |
-        (col("amount") > Q3 + 1.5 * IQR),
-        1
-    ).otherwise(0)
+    "hour_bin",
+    concat(
+        lpad((col("hour") / 4).cast("int") * 4, 2, "0"),
+        lit("-"),
+        lpad(((col("hour") / 4).cast("int") * 4 + 4), 2, "0")
+    )
 )
 
-df.groupBy("amount_outlier").count().show()
-
-# High-value transaction flag
-df = df.withColumn(
-    "high_value_txn",
-    when(col("amount") > Q3, 1).otherwise(0)
-)
-
-# Extract hour from timestamp
-df = df.withColumn(
-    "hour",
-    hour(col("time"))
-)
-
-# Convert to Pandas for Visualization
+# Convert to Pandas
 pdf = df.select(
     "amount",
-    "log_amount",
     "city",
     "card_type",
     "status",
-    "hour",
-    "high_value_txn"
-).sample(0.3).toPandas()
+    "hour_bin",
+    "date"
+).toPandas()
 
-# Visualization
+# Convert date format to DD/MM/YY
+pdf["date"] = pd.to_datetime(pdf["date"]).dt.strftime("%d/%m/%y")
+
+# Transaction Amount Distribution with mean
 plt.figure()
 sns.histplot(pdf["amount"], bins=50)
+plt.axvline(pdf["amount"].mean(), linestyle="--")
 plt.title("Transaction Amount Distribution")
+plt.xlabel("Amount")
+plt.ylabel("Frequency")
 plt.show()
 
+# Number of transactions vs time of day with mean
 plt.figure()
-sns.boxplot(x=pdf["amount"])
-plt.title("Amount Outliers")
+txn_by_hour = pdf["hour_bin"].value_counts().sort_index()
+txn_by_hour.plot(kind="bar")
+plt.axhline(txn_by_hour.mean(), linestyle="--")
+plt.title("Number Of Transactions Vs Time Of Day")
+plt.xlabel("Time Of Day")
+plt.ylabel("Number Of Transactions")
 plt.show()
 
+# Total transaction amount by city with mean
 plt.figure()
-sns.countplot(data=pdf, x="card_type")
-plt.title("Transactions by Card Type")
+city_amount = pdf.groupby("city")["amount"].sum().sort_values(ascending=False)
+city_amount.plot(kind="bar")
+plt.axhline(city_amount.mean(), linestyle="--")
+plt.title("Total Transaction Amount By City")
+plt.xlabel("City")
+plt.ylabel("Total Amount")
 plt.show()
 
+# Transaction frequency over days with rolling mean
 plt.figure()
-sns.scatterplot(x=pdf["hour"], y=pdf["amount"])
-plt.title("Transaction Amount vs Hour")
+daily_txn = pdf.groupby("date").size()
+daily_txn.plot(kind="line", label="Daily Transactions")
+daily_txn.rolling(window=5).mean().plot(label="Rolling Mean")
+plt.title("Transaction Frequency Over Days")
+plt.xlabel("Date (DD/MM/YY)")
+plt.ylabel("Number Of Transactions")
+plt.legend()
 plt.show()
 
-# Simple Prediction Logic
-pdf["predicted_risk"] = pdf["amount"].apply(
-    lambda x: 1 if x > Q3 else 0
-)
-
-print(pdf[["amount", "predicted_risk"]].head())
-
-# Final Schema
+# Final schema
 df.printSchema()
