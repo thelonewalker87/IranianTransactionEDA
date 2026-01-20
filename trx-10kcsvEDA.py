@@ -5,6 +5,8 @@ from pyspark.sql.types import *
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import numpy as np
+from matplotlib.ticker import FuncFormatter
 
 # Spark Session
 spark = SparkSession.builder \
@@ -18,6 +20,10 @@ df = spark.read \
     .option("mode", "DROPMALFORMED") \
     .csv("C:\\Users\\Ahaan\\Desktop\\AI\\IranTransactionEDA\\trx-10k.csv")
 
+print("Initial Schema")
+df.printSchema()
+df.show(5)
+
 # Identify numeric and non-numeric columns
 numeric_cols = [
     c for c, t in df.dtypes
@@ -28,54 +34,37 @@ non_numeric_cols = [
     c for c in df.columns if c not in numeric_cols
 ]
 
-# Standardize categorical columns
+# Normalize text columns
 for c in non_numeric_cols:
     df = df.withColumn(
         c,
-        lower(
-            trim(
-                regexp_replace(col(c), "\\s+", " ")
-            )
-        )
+        lower(trim(regexp_replace(col(c), "\\s+", " ")))
     )
 
-# Unify status values
+# Unify status column
 df = df.withColumn(
     "status",
-    when(col("status").isin(
-        "success", "succeed", "successful", "succeded", "ok", "completed"
-    ), "Success")
-    .when(col("status").isin(
-        "fail", "failed", "failure", "unsuccessful", "declined", "error"
-    ), "Fail")
+    when(col("status").rlike("success|succeed|completed|ok|approved"), "Success")
+    .when(col("status").rlike("fail|failed|declined|error|rejected"), "Fail")
     .otherwise("Unknown")
 )
 
-# Unify city values
+# Unify city column
 df = df.withColumn(
     "city",
-    when(col("city").isin(
-        "tehran", "thr", "tehr@n", "teheran", "thran", "teh ran", "t e h r a n"
-    ), "Tehran")
+    when(col("city").rlike("tehran|thr|tehr@n|thran|teheran|teh-ran"), "Tehran")
     .otherwise(initcap(col("city")))
 )
 
 # Unify card types
 df = df.withColumn(
     "card_type",
-    when(col("card_type").isin(
-        "visa", "vsa", "vi sa", "visa-card", "visa card"
-    ), "Visa")
-    .when(col("card_type").isin(
-        "mastercard", "master card", "master-card", "mastcard", "mstrcrd", "mc"
-    ), "MasterCard")
-    .when(col("card_type").isin(
-        "amex", "american express", "american-express", "am ex"
-    ), "Amex")
+    when(col("card_type").rlike("visa|vsa"), "Visa")
+    .when(col("card_type").rlike("mastercard|master card|master-card|mastcard"), "MasterCard")
     .otherwise(initcap(col("card_type")))
 )
 
-# Remove commas
+# Remove commas from all columns
 for c in df.columns:
     df = df.withColumn(c, regexp_replace(col(c), ",", ""))
 
@@ -83,75 +72,106 @@ for c in df.columns:
 for c in numeric_cols:
     df = df.withColumn(c, col(c).cast(DoubleType()))
 
-# Drop nulls and duplicates
+# Drop rows with null numeric values
 df = df.dropna(subset=numeric_cols)
+
+# Remove duplicate rows
 df = df.dropDuplicates()
 
 # Feature engineering
-df = df.withColumn("hour", hour(col("time")))
-df = df.withColumn("date", to_date(col("time")))
+df = df.withColumn("Amount_Million_IRR", col("amount") / 1_000_000)
+df = df.withColumn("Log_Amount_Million_IRR", log1p(col("Amount_Million_IRR")))
+df = df.withColumn("Hour", hour(col("time")))
 
-# 4-hour bins
 df = df.withColumn(
-    "hour_bin",
+    "Hour_Bin",
     concat(
-        lpad((col("hour") / 4).cast("int") * 4, 2, "0"),
-        lit("-"),
-        lpad(((col("hour") / 4).cast("int") * 4 + 4), 2, "0")
+        lpad((floor(col("Hour") / 4) * 4).cast("string"), 2, "0"),
+        lit(":00-"),
+        lpad((floor(col("Hour") / 4) * 4 + 4).cast("string"), 2, "0"),
+        lit(":00")
     )
+)
+
+# Outlier threshold
+quantiles = df.approxQuantile("amount", [0.25, 0.75], 0.01)
+Q1, Q3 = quantiles
+
+df = df.withColumn(
+    "High_Value_Txn",
+    when(col("amount") > Q3, 1).otherwise(0)
 )
 
 # Convert to Pandas
 pdf = df.select(
-    "amount",
+    "Amount_Million_IRR",
+    "Log_Amount_Million_IRR",
     "city",
     "card_type",
     "status",
-    "hour_bin",
-    "date"
+    "Hour_Bin",
+    "time"
 ).toPandas()
 
-# Convert date format to DD/MM/YY
-pdf["date"] = pd.to_datetime(pdf["date"]).dt.strftime("%d/%m/%y")
+# Date formatting
+pdf["Date"] = pd.to_datetime(pdf["time"]).dt.strftime("%d/%m/%y")
 
-# Transaction Amount Distribution with mean
+# Formatter for readability
+million_formatter = FuncFormatter(lambda x, _: f"{x:,.1f}")
+
+# Transaction Amount Distribution (Log-scaled)
 plt.figure()
-sns.histplot(pdf["amount"], bins=50)
-plt.axvline(pdf["amount"].mean(), linestyle="--")
-plt.title("Transaction Amount Distribution")
-plt.xlabel("Amount")
-plt.ylabel("Frequency")
+sns.histplot(pdf["Log_Amount_Million_IRR"], bins=50, stat="density")
+sns.kdeplot(pdf["Log_Amount_Million_IRR"])
+
+plt.axvline(pdf["Log_Amount_Million_IRR"].mean(), linestyle="--")
+
+plt.title("Transaction Amount Distribution (Million IRR, Log Scaled)")
+plt.xlabel("Transaction Amount (Million IRR)")
+plt.ylabel("Density")
 plt.show()
 
-# Number of transactions vs time of day with mean
-plt.figure()
-txn_by_hour = pdf["hour_bin"].value_counts().sort_index()
-txn_by_hour.plot(kind="bar")
-plt.axhline(txn_by_hour.mean(), linestyle="--")
-plt.title("Number Of Transactions Vs Time Of Day")
-plt.xlabel("Time Of Day")
-plt.ylabel("Number Of Transactions")
-plt.show()
+# City vs Total Transaction Amount
+city_amount = pdf.groupby("city")["Amount_Million_IRR"].sum().sort_values(ascending=False)
 
-# Total transaction amount by city with mean
 plt.figure()
-city_amount = pdf.groupby("city")["amount"].sum().sort_values(ascending=False)
 city_amount.plot(kind="bar")
 plt.axhline(city_amount.mean(), linestyle="--")
+
 plt.title("Total Transaction Amount By City")
 plt.xlabel("City")
-plt.ylabel("Total Amount")
+plt.ylabel("Total Amount (Million IRR)")
+plt.gca().yaxis.set_major_formatter(million_formatter)
 plt.show()
 
-# Transaction frequency over days with rolling mean
+# Transaction probability by time of day
+txn_by_hour = pdf["Hour_Bin"].value_counts().sort_index()
+txn_prob = txn_by_hour / txn_by_hour.sum()
+
 plt.figure()
-daily_txn = pdf.groupby("date").size()
-daily_txn.plot(kind="line", label="Daily Transactions")
-daily_txn.rolling(window=5).mean().plot(label="Rolling Mean")
-plt.title("Transaction Frequency Over Days")
+sns.lineplot(x=txn_prob.index, y=txn_prob.values, marker="o")
+
+plt.title("Transaction Probability By Time Of Day")
+plt.xlabel("Time Of Day")
+plt.ylabel("Transaction Probability")
+plt.xticks(rotation=45)
+plt.show()
+
+# Daily transaction frequency wave plot
+daily_txn = pdf.groupby("Date").size()
+
+plt.figure()
+sns.lineplot(x=daily_txn.index, y=daily_txn.values)
+sns.lineplot(
+    x=daily_txn.index,
+    y=daily_txn.rolling(window=7, min_periods=1).mean(),
+    linestyle="--"
+)
+
+plt.title("Daily Transaction Frequency Over Time")
 plt.xlabel("Date (DD/MM/YY)")
 plt.ylabel("Number Of Transactions")
-plt.legend()
+plt.xticks(rotation=45)
 plt.show()
 
 # Final schema
